@@ -114,6 +114,7 @@ public protocol DatabaseReader: AnyObject {
     /// - parameter block: A block that accesses the database.
     /// - throws: The error thrown by the block, or any DatabaseError that would
     ///   happen while establishing the read access to the database.
+    @_disfavoredOverload // SR-15150 Async overloading in protocol implementation fails
     func read<T>(_ block: (Database) throws -> T) throws -> T
     
     #if compiler(>=5.0)
@@ -298,6 +299,50 @@ extension DatabaseReader {
     }
 }
 
+extension DatabaseReader {
+    // MARK: - Asynchronous Database Access
+
+    /// Executes read-only database operations, and returns their result after
+    /// they have finished executing.
+    ///
+    /// - note: [**🔥 EXPERIMENTAL**](https://github.com/groue/GRDB.swift/blob/master/README.md#what-are-experimental-features)
+    ///
+    /// For example:
+    ///
+    /// ```swift
+    /// let count = try await reader.read { db in
+    ///     try Player.fetchCount(db)
+    /// }
+    /// ```
+    ///
+    /// Database operations are isolated in a transaction: they do not see
+    /// changes performed by eventual concurrent writes (even writes performed
+    /// by other processes).
+    ///
+    /// The database connection is read-only: attempts to write throw a
+    /// ``DatabaseError`` with resultCode `SQLITE_READONLY`.
+    ///
+    /// The ``Database`` argument to `value` is valid only during the execution
+    /// of the closure. Do not store or return the database connection for
+    /// later use.
+    ///
+    /// - parameter value: A closure which accesses the database.
+    /// - throws: The error thrown by `value`, or any ``DatabaseError`` that
+    ///   would happen while establishing the database access.
+    @available(iOS 13, macOS 10.15, tvOS 13, watchOS 6, *)
+    public func read<T>(_ value: @Sendable @escaping (Database) throws -> T) async throws -> T {
+        try await withUnsafeThrowingContinuation { continuation in
+            asyncRead { result in
+                do {
+                    try continuation.resume(returning: value(result.get()))
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+}
+
 /// A type-erased DatabaseReader
 ///
 /// Instances of AnyDatabaseReader forward their methods to an arbitrary
@@ -325,6 +370,7 @@ public final class AnyDatabaseReader: DatabaseReader {
     // MARK: - Reading from Database
     
     /// :nodoc:
+    @_disfavoredOverload // SR-15150 Async overloading in protocol implementation fails
     public func read<T>(_ block: (Database) throws -> T) throws -> T {
         return try base.read(block)
     }

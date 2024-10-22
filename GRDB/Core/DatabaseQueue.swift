@@ -214,6 +214,7 @@ extension DatabaseQueue {
     ///
     /// - parameter block: A block that accesses the database.
     /// - throws: The error thrown by the block.
+    @_disfavoredOverload // SR-15150 Async overloading in protocol implementation fails
     public func read<T>(_ block: (Database) throws -> T) rethrows -> T {
         return try writer.sync { db in
             try db.readOnly { try block(db) }

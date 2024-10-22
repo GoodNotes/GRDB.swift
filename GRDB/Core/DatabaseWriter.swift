@@ -36,6 +36,7 @@ public protocol DatabaseWriter: DatabaseReader {
     /// - parameter updates: The updates to the database.
     /// - throws: The error thrown by the updates, or by the
     ///   wrapping transaction.
+    @_disfavoredOverload // SR-15150 Async overloading in protocol implementation fails
     func write<T>(_ updates: (Database) throws -> T) throws -> T
     
     /// Synchronously executes database updates in a protected dispatch queue,
@@ -51,6 +52,7 @@ public protocol DatabaseWriter: DatabaseReader {
     ///
     /// - parameter updates: The updates to the database.
     /// - throws: The error thrown by the updates.
+    @_disfavoredOverload // SR-15150 Async overloading in protocol implementation fails
     func writeWithoutTransaction<T>(_ updates: (Database) throws -> T) rethrows -> T
     
     /// Synchronously executes database updates in a protected dispatch queue,
@@ -208,6 +210,7 @@ extension DatabaseWriter {
     /// - parameter updates: The updates to the database.
     /// - throws: The error thrown by the updates, or by the
     ///   wrapping transaction.
+    @_disfavoredOverload // SR-15150 Async overloading in protocol implementation fails
     public func write<T>(_ updates: (Database) throws -> T) throws -> T {
         return try writeWithoutTransaction { db in
             var result: T?
@@ -292,6 +295,7 @@ extension DatabaseWriter {
     ///
     /// - precondition: database is not accessed concurrently during the
     ///   execution of this method.
+    @_disfavoredOverload // SR-15150 Async overloading in protocol implementation fails
     public func erase() throws {
         try writeWithoutTransaction { try $0.erase() }
     }
@@ -302,6 +306,7 @@ extension DatabaseWriter {
     /// disk space.
     ///
     /// See https://www.sqlite.org/lang_vacuum.html for more information.
+    @_disfavoredOverload // SR-15150 Async overloading in protocol implementation fails
     public func vacuum() throws {
         try writeWithoutTransaction { try $0.execute(sql: "VACUUM") }
     }
@@ -521,6 +526,147 @@ extension DatabaseWriter {
     }
 }
 
+extension DatabaseWriter {
+    // MARK: - Asynchronous Database Access
+
+    /// Executes database operations, and returns their result after they have
+    /// finished executing.
+    ///
+    /// - note: [**🔥 EXPERIMENTAL**](https://github.com/groue/GRDB.swift/blob/master/README.md#what-are-experimental-features)
+    ///
+    /// For example:
+    ///
+    /// ```swift
+    /// let newPlayerCount = try await writer.write { db in
+    ///     try Player(name: "Arthur").insert(db)
+    ///     return try Player.fetchCount(db)
+    /// }
+    /// ```
+    ///
+    /// Database operations are wrapped in a transaction. If they throw an
+    /// error, the transaction is rollbacked and the error is rethrown.
+    ///
+    /// Concurrent database accesses can not see partial database updates (even
+    /// when performed by other processes).
+    ///
+    /// Database operations run in the writer dispatch queue, serialized
+    /// with all database updates performed by this `DatabaseWriter`.
+    ///
+    /// The ``Database`` argument to `updates` is valid only during the
+    /// execution of the closure. Do not store or return the database connection
+    /// for later use.
+    ///
+    /// - parameter updates: A closure which accesses the database.
+    /// - throws: The error thrown by `updates`, or any ``DatabaseError`` that
+    ///   would happen while establishing the database access or committing
+    ///   the transaction.
+    @available(iOS 13, macOS 10.15, tvOS 13, watchOS 6, *)
+    public func write<T>(_ updates: @Sendable @escaping (Database) throws -> T) async throws -> T {
+        try await withUnsafeThrowingContinuation { continuation in
+            asyncWrite(updates, completion: { _, result in
+                continuation.resume(with: result)
+            })
+        }
+    }
+
+    /// Executes database operations, and returns their result after they have
+    /// finished executing.
+    ///
+    /// - note: [**🔥 EXPERIMENTAL**](https://github.com/groue/GRDB.swift/blob/master/README.md#what-are-experimental-features)
+    ///
+    /// For example:
+    ///
+    /// ```swift
+    /// let newPlayerCount = try await writer.writeWithoutTransaction { db in
+    ///     try Player(name: "Arthur").insert(db)
+    ///     return try Player.fetchCount(db)
+    /// }
+    /// ```
+    ///
+    /// Database operations run in the writer dispatch queue, serialized
+    /// with all database updates performed by this `DatabaseWriter`.
+    ///
+    /// The ``Database`` argument to `updates` is valid only during the
+    /// execution of the closure. Do not store or return the database connection
+    /// for later use.
+    ///
+    /// - warning: Database operations are not wrapped in a transaction. They
+    ///   can see changes performed by concurrent writes or writes performed by
+    ///   other processes: two identical requests performed by the `updates`
+    ///   closure may not return the same value. Concurrent database accesses
+    ///   can see partial updates performed by the `updates` closure.
+    ///
+    /// - parameter updates: A closure which accesses the database.
+    /// - throws: The error thrown by `updates`.
+    @available(iOS 13, macOS 10.15, tvOS 13, watchOS 6, *)
+    public func writeWithoutTransaction<T>(_ updates: @Sendable @escaping (Database) throws -> T) async throws -> T {
+        try await withUnsafeThrowingContinuation { continuation in
+            asyncWriteWithoutTransaction { db in
+                do {
+                    try continuation.resume(returning: updates(db))
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    /// Erase the database: delete all content, drop all tables, etc.
+    ///
+    /// - note: [**🔥 EXPERIMENTAL**](https://github.com/groue/GRDB.swift/blob/master/README.md#what-are-experimental-features)
+    @available(iOS 13, macOS 10.15, tvOS 13, watchOS 6, *)
+    public func erase() async throws {
+        try await writeWithoutTransaction { try $0.erase() }
+    }
+
+    /// Rebuilds the database file, repacking it into a minimal amount of
+    /// disk space.
+    ///
+    /// - note: [**🔥 EXPERIMENTAL**](https://github.com/groue/GRDB.swift/blob/master/README.md#what-are-experimental-features)
+    ///
+    /// Related SQLite documentation: <https://www.sqlite.org/lang_vacuum.html>
+    @available(iOS 13, macOS 10.15, tvOS 13, watchOS 6, *)
+    public func vacuum() async throws {
+        try await writeWithoutTransaction { try $0.execute(sql: "VACUUM") }
+    }
+
+#if GRDBCUSTOMSQLITE || GRDBCIPHER
+    /// Creates a new database file at the specified path with a minimum
+    /// amount of disk space.
+    ///
+    /// - note: [**🔥 EXPERIMENTAL**](https://github.com/groue/GRDB.swift/blob/master/README.md#what-are-experimental-features)
+    ///
+    /// Databases encrypted with SQLCipher are copied with the same password
+    /// and configuration as the original database.
+    ///
+    /// Related SQLite documentation: <https://www.sqlite.org/lang_vacuum.html#vacuuminto>
+    ///
+    /// - Parameter filePath: file path for new database
+    @available(iOS 13, macOS 10.15, tvOS 13, watchOS 6, *)
+    public func vacuum(into filePath: String) async throws {
+        try await writeWithoutTransaction {
+            try $0.execute(sql: "VACUUM INTO ?", arguments: [filePath])
+        }
+    }
+#else
+    /// Creates a new database file at the specified path with a minimum
+    /// amount of disk space.
+    ///
+    /// - note: [**🔥 EXPERIMENTAL**](https://github.com/groue/GRDB.swift/blob/master/README.md#what-are-experimental-features)
+    ///
+    /// Related SQLite documentation: <https://www.sqlite.org/lang_vacuum.html#vacuuminto>
+    ///
+    /// - Parameter filePath: file path for new database
+    @available(iOS 13, macOS 10.15, tvOS 13, watchOS 6, *)
+    public func vacuum(into filePath: String) async throws {
+        try await writeWithoutTransaction {
+            try $0.execute(sql: "VACUUM INTO ?", arguments: [filePath])
+        }
+    }
+#endif
+}
+
+
 /// A future database value, returned by the DatabaseWriter.concurrentRead(_:)
 /// method.
 ///
@@ -587,6 +733,7 @@ public final class AnyDatabaseWriter: DatabaseWriter {
     // MARK: - Reading from Database
     
     /// :nodoc:
+    @_disfavoredOverload // SR-15150 Async overloading in protocol implementation fails
     public func read<T>(_ block: (Database) throws -> T) throws -> T {
         return try base.read(block)
     }
@@ -623,11 +770,13 @@ public final class AnyDatabaseWriter: DatabaseWriter {
     // MARK: - Writing in Database
     
     /// :nodoc:
+    @_disfavoredOverload // SR-15150 Async overloading in protocol implementation fails
     public func write<T>(_ updates: (Database) throws -> T) throws -> T {
         return try base.write(updates)
     }
     
     /// :nodoc:
+    @_disfavoredOverload // SR-15150 Async overloading in protocol implementation fails
     public func writeWithoutTransaction<T>(_ updates: (Database) throws -> T) rethrows -> T {
         return try base.writeWithoutTransaction(updates)
     }
