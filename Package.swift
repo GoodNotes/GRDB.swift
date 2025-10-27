@@ -45,6 +45,7 @@ let package = Package(
     targets: [
         .systemLibrary(
             name: "GRDBSQLite",
+            pkgConfig: "sqlite3",
             providers: [.apt(["libsqlite3-dev"])]),
         .target(
             name: "GRDB",
